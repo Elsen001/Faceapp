@@ -1,8 +1,10 @@
 [phases.setup]
-nixPkgs = ["libxcb", "libGL", "glib", "libxcb"]
+nixPkgs = ["python311", "gcc", "glib", "zlib"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = [
+  "pip install flask insightface onnxruntime opencv-python-headless numpy pillow"
+]
 
 [start]
 cmd = "bash startup.sh"
