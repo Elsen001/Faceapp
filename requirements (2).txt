@@ -1,0 +1,7 @@
+torch
+torchvision
+torchaudio
+facexlib
+gfpgan
+basicsr
+codeformer  # əgər pip-də varsa
