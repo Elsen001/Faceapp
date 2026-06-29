@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="az">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>FaceSwap AI · Video & Şəkil Yüz Dəyişdirmə</title>
+<style>
+:root{
+  --bg:#0a0a0f;--surface:#13131a;--surface2:#1c1c28;
+  --border:#2a2a3d;--accent:#7c5cfc;--accent2:#c45cfc;
+  --accent-glow:rgba(124,92,252,.25);--green:#3dffc0;
+  --red:#ff4f72;--text:#f0eeff;--muted:#7a7a99;
+  --radius:16px;--r-sm:10px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.04'/%3E%3C/svg%3E");pointer-events:none;z-index:0;opacity:.5}
+.orb{position:fixed;border-radius:50%;filter:blur(120px);opacity:.18;pointer-events:none;z-index:0}
+.orb1{width:600px;height:600px;background:var(--accent);top:-200px;left:-200px}
+.orb2{width:500px;height:500px;background:var(--accent2);bottom:-150px;right:-150px}
+.wrapper{position:relative;z-index:1;max-width:960px;margin:0 auto;padding:2rem 1.5rem 4rem}
+
+header{text-align:center;padding:2.5rem 0 2rem}
+.logo{display:inline-flex;align-items:center;gap:.7rem;font-size:2.2rem;font-weight:800;letter-spacing:-.03em;background:linear-gradient(135deg,#c45cfc 0%,#7c5cfc 50%,#3dffc0 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.logo svg{flex-shrink:0}
+header p{color:var(--muted);margin-top:.5rem;font-size:1rem}
+
+/* Mode tabs */
+.mode-tabs{display:flex;gap:.5rem;background:var(--surface2);padding:.4rem;border-radius:12px;margin-bottom:1.5rem;border:1px solid var(--border)}
+.mode-tab{flex:1;padding:.7rem;border:none;border-radius:8px;cursor:pointer;font-weight:600;font-size:.9rem;transition:all .2s;background:transparent;color:var(--muted)}
+.mode-tab.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;box-shadow:0 2px 12px var(--accent-glow)}
+
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1.8rem;margin-bottom:1.2rem;backdrop-filter:blur(12px)}
+.card-title{font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:1.2rem;display:flex;align-items:center;gap:.5rem}
+.card-title::before{content:'';display:block;width:3px;height:14px;background:linear-gradient(to bottom,var(--accent),var(--accent2));border-radius:2px}
+
+.zones{display:grid;grid-template-columns:1fr 1fr;gap:1.2rem}
+@media(max-width:600px){.zones{grid-template-columns:1fr}}
+
+.drop-zone{border:2px dashed var(--border);border-radius:var(--r-sm);padding:1.8rem 1rem;text-align:center;cursor:pointer;transition:all .25s;position:relative;overflow:hidden;min-height:170px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.7rem}
+.drop-zone:hover,.drop-zone.drag-over{border-color:var(--accent);background:rgba(124,92,252,.06)}
+.drop-zone input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
+.drop-icon{font-size:2.2rem;line-height:1}
+.drop-label{font-weight:600;font-size:.9rem}
+.drop-sub{color:var(--muted);font-size:.78rem}
+.drop-preview{width:100%;height:100%;object-fit:cover;position:absolute;inset:0;border-radius:calc(var(--r-sm) - 2px);opacity:.9}
+.drop-preview-video{width:100%;position:absolute;inset:0;border-radius:calc(var(--r-sm) - 2px);height:100%;object-fit:cover;opacity:.9}
+.drop-badge{position:absolute;top:8px;right:8px;background:rgba(0,0,0,.75);backdrop-filter:blur(6px);padding:.22rem .55rem;border-radius:20px;font-size:.72rem;color:var(--green);font-weight:600;z-index:2}
+.drop-clear{position:absolute;top:8px;left:8px;z-index:2;background:rgba(0,0,0,.7);border:none;color:#fff;width:26px;height:26px;border-radius:50%;cursor:pointer;font-size:.9rem;display:flex;align-items:center;justify-content:center;transition:background .2s}
+.drop-clear:hover{background:var(--red)}
+
+.options-row{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;margin-top:1rem}
+.toggle-group{display:flex;align-items:center;gap:.6rem;cursor:pointer}
+.toggle-group input{display:none}
+.toggle{width:42px;height:23px;border-radius:12px;background:var(--surface2);border:1px solid var(--border);position:relative;transition:background .2s}
+.toggle::after{content:'';position:absolute;top:3px;left:3px;width:15px;height:15px;border-radius:50%;background:var(--muted);transition:all .2s}
+.toggle-group input:checked+.toggle{background:var(--accent)}
+.toggle-group input:checked+.toggle::after{left:calc(100% - 18px);background:#fff}
+.toggle-label{font-size:.88rem;color:var(--muted)}
+
+.btn-swap{width:100%;padding:1rem;border:none;border-radius:var(--r-sm);background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;font-size:1.05rem;font-weight:700;cursor:pointer;letter-spacing:.02em;position:relative;overflow:hidden;transition:opacity .2s,transform .15s;box-shadow:0 4px 24px var(--accent-glow)}
+.btn-swap:hover:not(:disabled){opacity:.9;transform:translateY(-1px)}
+.btn-swap:disabled{opacity:.5;cursor:not-allowed}
+.btn-swap .shimmer{position:absolute;inset:0;background:linear-gradient(105deg,transparent 40%,rgba(255,255,255,.15) 50%,transparent 60%);transform:translateX(-100%);animation:shimmer 2.4s infinite}
+@keyframes shimmer{to{transform:translateX(200%)}}
+
+#progressSection{display:none}
+.progress-bar-wrap{background:var(--surface2);border-radius:6px;height:8px;overflow:hidden;margin:1rem 0 .6rem}
+.progress-bar-fill{height:100%;border-radius:6px;background:linear-gradient(90deg,var(--accent),var(--accent2),var(--green));background-size:200%;animation:bar-shift 2s linear infinite;transition:width .5s ease;width:0%}
+@keyframes bar-shift{0%{background-position:0%}100%{background-position:200%}}
+.progress-msg{font-size:.85rem;color:var(--muted)}
+.progress-pct{font-size:.85rem;color:var(--text);font-weight:600}
+
+#resultSection{display:none}
+.result-media{width:100%;border-radius:var(--r-sm);margin-top:1rem;background:#000;max-height:500px}
+.result-img{width:100%;border-radius:var(--r-sm);margin-top:1rem;max-height:500px;object-fit:contain}
+.btn-dl{display:inline-flex;align-items:center;gap:.5rem;margin-top:1rem;padding:.75rem 1.5rem;background:linear-gradient(135deg,#3dffc0,#7c5cfc);color:#0a0a0f;font-weight:700;border-radius:var(--r-sm);text-decoration:none;transition:opacity .2s,transform .15s;box-shadow:0 4px 20px rgba(61,255,192,.2)}
+.btn-dl:hover{opacity:.9;transform:translateY(-1px)}
+
+#errorSection{display:none}
+.error-box{background:rgba(255,79,114,.1);border:1px solid rgba(255,79,114,.3);border-radius:var(--r-sm);padding:1rem 1.2rem;color:#ff8fa8;font-size:.9rem;line-height:1.6}
+
+.quality-badge{display:inline-flex;align-items:center;gap:.4rem;background:rgba(61,255,192,.1);border:1px solid rgba(61,255,192,.25);border-radius:20px;padding:.3rem .8rem;font-size:.78rem;color:var(--green);font-weight:600;margin-top:.5rem}
+
+footer{text-align:center;color:var(--muted);font-size:.78rem;padding-top:2rem}
+</style>
+</head>
+<body>
+<div class="orb orb1"></div>
+<div class="orb orb2"></div>
+<div class="wrapper">
+
+<header>
+  <div class="logo">
+    <svg width="34" height="34" viewBox="0 0 36 36" fill="none">
+      <circle cx="18" cy="18" r="18" fill="url(#lg)"/>
+      <path d="M12 14c0-3.31 2.69-6 6-6s6 2.69 6 6c0 2.5-1.52 4.65-3.7 5.57L24 26H12l3.7-6.43C13.52 18.65 12 16.5 12 14z" fill="white" opacity=".9"/>
+      <defs><linearGradient id="lg" x1="0" y1="0" x2="36" y2="36"><stop offset="0%" stop-color="#7c5cfc"/><stop offset="100%" stop-color="#c45cfc"/></linearGradient></defs>
+    </svg>
+    FaceSwap AI
+  </div>
+  <p>Video və şəkildəki üzü AI ilə dəqiq şəkildə dəyişdir</p>
+  <div class="quality-badge">✨ INSwapper + GFPGAN · Yüksək keyfiyyət</div>
+</header>
+
+<!-- Mode Tabs -->
+<div class="mode-tabs">
+  <button class="mode-tab active" id="tabVideo" onclick="setMode('video')">🎬 Video</button>
+  <button class="mode-tab" id="tabImage" onclick="setMode('image')">🖼️ Şəkil</button>
+</div>
+
+<!-- Upload Card -->
+<div class="card">
+  <div class="card-title">Fayl seçimi</div>
+  <div class="zones">
+    <!-- Source face -->
+    <div class="drop-zone" id="sourceZone">
+      <input type="file" id="sourceInput" accept="image/*"/>
+      <div class="drop-icon">🤳</div>
+      <div class="drop-label">Üz şəkli</div>
+      <div class="drop-sub">Aydın, tək üzlü şəkil<br>JPG · PNG · WebP</div>
+      <button class="drop-clear" id="sourceClear" style="display:none" onclick="clearSource(event)">✕</button>
+      <img class="drop-preview" id="sourcePreview" style="display:none" alt=""/>
+      <span class="drop-badge" id="sourceBadge" style="display:none">✓ Üz</span>
+    </div>
+    <!-- Target -->
+    <div class="drop-zone" id="targetZone">
+      <input type="file" id="targetInput" accept="video/*"/>
+      <div class="drop-icon" id="targetIcon">🎬</div>
+      <div class="drop-label" id="targetLabel">Hədəf Video</div>
+      <div class="drop-sub" id="targetSub">MP4 · AVI · MOV · MKV<br>Maks. 500 MB</div>
+      <button class="drop-clear" id="targetClear" style="display:none" onclick="clearTarget(event)">✕</button>
+      <video class="drop-preview-video" id="targetVideoPreview" style="display:none" autoplay muted loop playsinline></video>
+      <img class="drop-preview" id="targetImgPreview" style="display:none" alt=""/>
+      <span class="drop-badge" id="targetBadge" style="display:none">✓ Hədəf</span>
+    </div>
+  </div>
+  <div class="options-row">
+    <label class="toggle-group">
+      <input type="checkbox" id="allFacesToggle"/>
+      <span class="toggle"></span>
+      <span class="toggle-label">Bütün üzləri dəyiş</span>
+    </label>
+  </div>
+</div>
+
+<button class="btn-swap" id="swapBtn" onclick="startSwap()">
+  <span class="shimmer"></span>
+  ✨ Üzü Dəyişdir
+</button>
+
+<div class="card" id="progressSection" style="margin-top:1.2rem">
+  <div class="card-title">İşlənir...</div>
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <span class="progress-msg" id="progressMsg">Hazırlaşır...</span>
+    <span class="progress-pct" id="progressPct">0%</span>
+  </div>
+  <div class="progress-bar-wrap"><div class="progress-bar-fill" id="progressFill"></div></div>
+  <div style="font-size:.78rem;color:var(--muted)">Videunun uzunluğuna görə bir neçə dəqiqə çəkə bilər.</div>
+</div>
+
+<div class="card" id="errorSection" style="margin-top:1.2rem">
+  <div class="card-title">Xəta</div>
+  <div class="error-box" id="errorMsg"></div>
+  <button class="btn-swap" style="margin-top:1rem;width:auto;padding:.7rem 1.5rem" onclick="resetUI()">↩ Yenidən Cəhd Et</button>
+</div>
+
+<div class="card" id="resultSection" style="margin-top:1.2rem">
+  <div class="card-title">Nəticə</div>
+  <video class="result-media" id="resultVideo" controls playsinline style="display:none"></video>
+  <img class="result-img" id="resultImage" style="display:none" alt="Nəticə"/>
+  <br>
+  <a class="btn-dl" id="downloadLink" href="#" download>⬇ Yüklə</a>
+  <button class="btn-swap" style="margin-top:.75rem;width:auto;padding:.7rem 1.5rem;background:var(--surface2);box-shadow:none;border:1px solid var(--border)" onclick="resetUI()">↩ Yeni</button>
+</div>
+
+<footer>FaceSwap AI · InsightFace INSwapper + GFPGAN · Yüksək keyfiyyət</footer>
+</div>
+
+<script>
+let sourceFile = null, targetFile = null;
+let currentMode = 'video';
+let sseSource = null;
+
+function setMode(mode) {
+  currentMode = mode;
+  document.getElementById('tabVideo').classList.toggle('active', mode==='video');
+  document.getElementById('tabImage').classList.toggle('active', mode==='image');
+  const inp = document.getElementById('targetInput');
+  if (mode === 'video') {
+    inp.accept = 'video/*';
+    document.getElementById('targetIcon').textContent = '🎬';
+    document.getElementById('targetLabel').textContent = 'Hədəf Video';
+    document.getElementById('targetSub').textContent = 'MP4 · AVI · MOV · MKV · WebM';
+  } else {
+    inp.accept = 'image/*';
+    document.getElementById('targetIcon').textContent = '🖼️';
+    document.getElementById('targetLabel').textContent = 'Hədəf Şəkil';
+    document.getElementById('targetSub').textContent = 'JPG · PNG · WebP · BMP';
+  }
+  clearTarget({stopPropagation:()=>{}});
+}
+
+// Drag & drop
+['sourceZone','targetZone'].forEach((zid,i) => {
+  const inp = ['sourceInput','targetInput'][i];
+  const zone = document.getElementById(zid);
+  zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag-over'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+  zone.addEventListener('drop', e => {
+    e.preventDefault(); zone.classList.remove('drag-over');
+    const f = e.dataTransfer?.files?.[0];
+    if (f) { const dt = new DataTransfer(); dt.items.add(f); document.getElementById(inp).files = dt.files; document.getElementById(inp).dispatchEvent(new Event('change')); }
+  });
+});
+
+document.getElementById('sourceInput').addEventListener('change', function() {
+  const f = this.files?.[0]; if (!f) return;
+  sourceFile = f;
+  const url = URL.createObjectURL(f);
+  document.getElementById('sourcePreview').src = url;
+  document.getElementById('sourcePreview').style.display = 'block';
+  document.getElementById('sourceBadge').style.display = 'block';
+  document.getElementById('sourceClear').style.display = 'flex';
+  document.getElementById('sourceZone').querySelectorAll('.drop-icon,.drop-label,.drop-sub').forEach(el => el.style.display='none');
+});
+
+document.getElementById('targetInput').addEventListener('change', function() {
+  const f = this.files?.[0]; if (!f) return;
+  targetFile = f;
+  const url = URL.createObjectURL(f);
+  const isVideo = f.type.startsWith('video/');
+  document.getElementById('targetVideoPreview').style.display = isVideo ? 'block' : 'none';
+  document.getElementById('targetImgPreview').style.display = isVideo ? 'none' : 'block';
+  if (isVideo) document.getElementById('targetVideoPreview').src = url;
+  else document.getElementById('targetImgPreview').src = url;
+  document.getElementById('targetBadge').style.display = 'block';
+  document.getElementById('targetClear').style.display = 'flex';
+  document.getElementById('targetZone').querySelectorAll('.drop-icon,.drop-label,.drop-sub').forEach(el => el.style.display='none');
+});
+
+function clearSource(e) {
+  e.stopPropagation(); sourceFile = null;
+  document.getElementById('sourceInput').value = '';
+  document.getElementById('sourcePreview').style.display = 'none';
+  document.getElementById('sourceBadge').style.display = 'none';
+  document.getElementById('sourceClear').style.display = 'none';
+  document.getElementById('sourceZone').querySelectorAll('.drop-icon,.drop-label,.drop-sub').forEach(el => el.style.display='');
+}
+function clearTarget(e) {
+  e.stopPropagation(); targetFile = null;
+  document.getElementById('targetInput').value = '';
+  document.getElementById('targetVideoPreview').style.display = 'none';
+  document.getElementById('targetImgPreview').style.display = 'none';
+  document.getElementById('targetBadge').style.display = 'none';
+  document.getElementById('targetClear').style.display = 'none';
+  document.getElementById('targetZone').querySelectorAll('.drop-icon,.drop-label,.drop-sub').forEach(el => el.style.display='');
+}
+
+async function startSwap() {
+  if (!sourceFile) return alert('Üz şəkli seçin.');
+  if (!targetFile) return alert(currentMode==='video' ? 'Video seçin.' : 'Hədəf şəkil seçin.');
+
+  const btn = document.getElementById('swapBtn');
+  btn.disabled = true;
+  showSection('progressSection');
+  hideSection('resultSection');
+  hideSection('errorSection');
+
+  const fd = new FormData();
+  fd.append('source', sourceFile);
+  fd.append('target', targetFile);
+  fd.append('mode', currentMode);
+  fd.append('all_faces', document.getElementById('allFacesToggle').checked ? 'true' : 'false');
+
+  let jobId;
+  try {
+    const r = await fetch('/swap', { method:'POST', body:fd });
+    const d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || 'Server xətası');
+    jobId = d.job_id;
+  } catch(err) { showError(err.message); btn.disabled=false; return; }
+
+  if (sseSource) sseSource.close();
+  sseSource = new EventSource(`/stream/${jobId}`);
+  sseSource.onmessage = e => {
+    const job = JSON.parse(e.data);
+    updateProgress(job.progress||0, job.message);
+    if (job.status==='done') { sseSource.close(); showResult(job.output, currentMode); btn.disabled=false; }
+    else if (job.status==='error') { sseSource.close(); showError(job.error||'Naməlum xəta'); btn.disabled=false; }
+  };
+  sseSource.onerror = () => { sseSource.close(); pollStatus(jobId, btn); };
+}
+
+function pollStatus(jobId, btn) {
+  const iv = setInterval(async () => {
+    try {
+      const r = await fetch(`/status/${jobId}`);
+      const job = await r.json();
+      updateProgress(job.progress||0, job.message);
+      if (job.status==='done') { clearInterval(iv); showResult(job.output, currentMode); btn.disabled=false; }
+      else if (job.status==='error') { clearInterval(iv); showError(job.error||'Naməlum xəta'); btn.disabled=false; }
+    } catch(e) {}
+  }, 1200);
+}
+
+function updateProgress(pct, msg) {
+  document.getElementById('progressFill').style.width = (pct||0) + '%';
+  document.getElementById('progressPct').textContent = (pct||0) + '%';
+  document.getElementById('progressMsg').textContent = msg || '';
+}
+
+function showResult(filename, mode) {
+  hideSection('progressSection');
+  showSection('resultSection');
+  const url = `/preview/${filename}`;
+  const vid = document.getElementById('resultVideo');
+  const img = document.getElementById('resultImage');
+  if (mode === 'image') {
+    vid.style.display = 'none'; img.style.display = 'block'; img.src = url;
+  } else {
+    img.style.display = 'none'; vid.style.display = 'block'; vid.src = url;
+  }
+  const dl = document.getElementById('downloadLink');
+  dl.href = `/download/${filename}`; dl.download = filename;
+}
+
+function showError(msg) { hideSection('progressSection'); showSection('errorSection'); document.getElementById('errorMsg').textContent = msg; }
+function resetUI() { hideSection('progressSection'); hideSection('resultSection'); hideSection('errorSection'); document.getElementById('swapBtn').disabled=false; if(sseSource){sseSource.close();sseSource=null;} }
+function showSection(id){document.getElementById(id).style.display='block'}
+function hideSection(id){document.getElementById(id).style.display='none'}
+</script>
+</body>
+</html>
