@@ -1,6 +1,6 @@
 import os, uuid, json, time, threading, logging
 from pathlib import Path
-from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
+from flask import Flask, render_template, request, jsonify, send_from_directory, Response, stream_with_context
 from werkzeug.utils import secure_filename
 
 BASE_DIR = Path(__file__).parent
@@ -40,15 +40,7 @@ def after_request(r):
 
 @app.route("/")
 def index():
-    # templates/ olmadan birbaşa index.html oxu
-    html_paths = [
-        BASE_DIR / "index.html",
-        BASE_DIR / "templates" / "index.html",
-    ]
-    for p in html_paths:
-        if p.exists():
-            return p.read_text(encoding="utf-8"), 200, {"Content-Type": "text/html"}
-    return "<h2>index.html tapılmadı</h2>", 404
+    return render_template("index.html")
 
 
 @app.route("/model-status")
@@ -223,3 +215,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     print(f"Server: http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+

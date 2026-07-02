@@ -54,6 +54,19 @@ from face_swapper import (
 
 log = logging.getLogger(__name__)
 
+
+def _to_int(v) -> int:
+    """
+    NumPy massivini (skalyar, (1,) və ya (1,1) formalı olsa belə) təhlükəsiz
+    şəkildə Python int-ə çevirir.
+    NumPy >= 1.25-də çox-ölçülü/yastı olmayan massiv üzərində birbaşa int(v)
+    çağırmaq "only 0-dimensional arrays can be converted to Python scalars"
+    xətası yaradır — bu funksiya bunun qarşısını alır.
+    """
+    if isinstance(v, np.ndarray):
+        v = v.reshape(-1)[0]
+    return int(v)
+
 # ──────────────────────── eynək + saç transfer köməkçiləri ────────────────────────
 
 def _extract_glasses_region(image: np.ndarray, face) -> Optional[np.ndarray]:
@@ -62,7 +75,7 @@ def _extract_glasses_region(image: np.ndarray, face) -> Optional[np.ndarray]:
     Göz zonasını qaytarır (bbox-ın yuxarı ~35%-i).
     """
     try:
-        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+        x1, y1, x2, y2 = [_to_int(v) for v in face.bbox]
         face_h = y2 - y1
         face_w = x2 - x1
         # Eynək zonası: gözlər face hündürlüyünün ~25%-55%-i arasında
@@ -85,7 +98,7 @@ def _extract_hair_region(image: np.ndarray, face) -> Optional[np.ndarray]:
     Üz bbox-ının üstündəki ~50% hündürlük regionu.
     """
     try:
-        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+        x1, y1, x2, y2 = [_to_int(v) for v in face.bbox]
         face_h = y2 - y1
         face_w = x2 - x1
         # Saç regionu: face-in üstündə, face_h qədər yuxarıya qədər
@@ -115,7 +128,7 @@ def _blend_region_onto_frame(
     Seamless clone ilə kənarlar hamar birləşir.
     """
     try:
-        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+        x1, y1, x2, y2 = [_to_int(v) for v in face.bbox]
         face_h = y2 - y1
         face_w = x2 - x1
 
@@ -195,9 +208,14 @@ def _blend_region_onto_frame(
 
 
 # ──────────────────────── sabitlər ────────────────────────
-DETECT_INTERVAL   = 8    # hər neçə frame-də bir yenidən tam detect
+# Mənbə şəkildəki eynək/saçı videoya köçürən kobud transfer (grabCut/Canny
+# düzbucaq blend). Titrəmə, görünən qutu kənarları yaradır və çox yavaşdır —
+# default söndürülüb. Lazım olsa True et.
+ENABLE_GLASSES_HAIR_TRANSFER = False
+
+DETECT_INTERVAL   = 2    # hər neçə frame-də bir yenidən tam detect (aşağı = az sürüşmə)
 SCENE_CUT_THRESH  = 35.0 # MAE threshold sahne keçidi üçün (LAB space)
-EMA_ALPHA         = 0.35 # keypoint EMA hamarlaşma faktoru (0=tam hamar, 1=ham)
+EMA_ALPHA         = 0.55 # keypoint EMA hamarlaşma faktoru (0=tam hamar, 1=ham)
 MAX_WORKERS       = 4    # paralel swap thread sayı
 TRACKER_TYPE      = "CSRT"  # KCF, CSRT, MOSSE — CSRT ən dəqiq
 
@@ -279,7 +297,7 @@ class FaceTracker:
         self._frame_cnt = 0
         self._lost_cnt  = 0
 
-        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+        x1, y1, x2, y2 = [_to_int(v) for v in face.bbox]
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(frame.shape[1] - 1, x2), min(frame.shape[0] - 1, y2)
         if x2 <= x1 or y2 <= y1:
@@ -296,6 +314,17 @@ class FaceTracker:
         """
         Frame üçün tracker-i yenilə.
         Returns: hamarlanmış face (kps + bbox) və ya None
+
+        DÜZƏLTMƏ — sürüşmə (sliding) problemi:
+        Əvvəlki versiya kps-ləri YALNIZ xətti scale ilə hesablayırdı.
+        Bu, üz döndükdə (yaw rotasiya) keypoint-lərin bbox daxilindəki
+        qeyri-xətti yerdəyişməsini tuta bilmir → align matrisi səhv
+        hesablanır → swap edilmiş üz sürüşür/əyilir.
+
+        Həll: hər tracker update-də əlavə yüngül lokal üz detect
+        (yalnız bbox ətrafı crop-da, sürətli) cəhd edilir. Tapılarsa
+        REAL kps istifadə olunur (yalnız EMA ilə hamarlanır), tapılmazsa
+        köhnə xətti scale fallback kimi qalır.
         """
         self._frame_cnt += 1
 
@@ -315,12 +344,24 @@ class FaceTracker:
             return self._last_face  # son uğurlu frame-i ver
 
         self._lost_cnt = 0
-        x, y, bw, bh = [int(v) for v in bbox_cv]
+        x, y, bw, bh = [_to_int(v) for v in bbox_cv]
 
-        # Son face-in kps-lərini bbox-a görə interpolasiya et
         face = self._last_face
-        if face is not None and hasattr(face, "kps") and face.kps is not None:
-            # Köhnə bbox → yeni bbox transform
+        real_kps = self._try_local_redetect(frame, x, y, bw, bh)
+
+        # DÜZƏLTMƏ — bbox da kps kimi EMA ilə hamarlanmalıdır, əks halda
+        # kps hamar, bbox isə titrəyən qalır → paste-back region sürüşür.
+        bbox_smooth = self._bbox_ema.update(
+            np.array([x, y, x + bw, y + bh], dtype=np.float32)
+        )
+
+        if real_kps is not None:
+            # ── Real detection tapıldı: bunu istifadə et (dəqiq, pose-aware) ──
+            kps_smooth = self._kps_ema.update(real_kps)
+            face_proxy = _FaceProxy(face, kps_smooth, bbox_smooth)
+            self._last_face = face_proxy
+        elif face is not None and hasattr(face, "kps") and face.kps is not None:
+            # ── Fallback: xətti scale (real detect tapılmadıqda) ──
             ox1, oy1, ox2, oy2 = face.bbox
             old_bw = max(ox2 - ox1, 1)
             old_bh = max(oy2 - oy1, 1)
@@ -330,25 +371,67 @@ class FaceTracker:
             kps_new[:, 0] = (kps_new[:, 0] - ox1) * sx + x
             kps_new[:, 1] = (kps_new[:, 1] - oy1) * sy + y
             kps_smooth = self._kps_ema.update(kps_new)
-
-            # Synthetic face object (kps + bbox güncəllənmiş)
-            face_proxy = _FaceProxy(face, kps_smooth,
-                                    np.array([x, y, x + bw, y + bh],
-                                             dtype=np.float32))
+            face_proxy = _FaceProxy(face, kps_smooth, bbox_smooth)
             self._last_face = face_proxy
 
         return self._last_face
+
+    def _try_local_redetect(self, frame: np.ndarray,
+                            x: int, y: int, bw: int, bh: int
+                            ) -> Optional[np.ndarray]:
+        """
+        Tracker bbox-ı ətrafında genişləndirilmiş bölgədə sürətli üz detect
+        cəhd et. Tapılarsa real (pose-doğru) kps qaytarır.
+
+        Bu, sürüşmənin əsas həllidir: hər frame-də (və ya hər 2-3 frame-də)
+        həqiqi landmark istifadə edir, sadəcə əvvəlki bbox-dan xətti
+        scale etmir.
+        """
+        try:
+            from face_swapper import get_face_app
+            h, w = frame.shape[:2]
+            pad = int(max(bw, bh) * 0.35)
+            rx1 = max(0, x - pad)
+            ry1 = max(0, y - pad)
+            rx2 = min(w, x + bw + pad)
+            ry2 = min(h, y + bh + pad)
+            if rx2 <= rx1 or ry2 <= ry1:
+                return None
+
+            crop = frame[ry1:ry2, rx1:rx2]
+            if crop.shape[0] < 40 or crop.shape[1] < 40:
+                return None
+
+            faces = get_face_app().get(crop)
+            if not faces:
+                return None
+
+            # Bbox mərkəzinə ən yaxın üzü seç
+            cx_target = bw / 2.0
+            cy_target = bh / 2.0
+            best = min(faces, key=lambda f: abs((f.bbox[0]+f.bbox[2])/2 - cx_target) +
+                                            abs((f.bbox[1]+f.bbox[3])/2 - cy_target))
+
+            kps = np.array(best.kps[:5], dtype=np.float32)
+            kps[:, 0] += rx1
+            kps[:, 1] += ry1
+            return kps
+        except Exception:
+            return None
 
     def reinit_with_face(self, frame: np.ndarray, face):
         """Re-detect sonrası tracker-i yeni üzlə yenilə."""
         kps_smooth = self._kps_ema.update(
             np.array(face.kps[:5], dtype=np.float32)
         )
-        face_proxy = _FaceProxy(face, kps_smooth, face.bbox)
+        bbox_smooth = self._bbox_ema.update(
+            np.asarray(face.bbox, dtype=np.float32)
+        )
+        face_proxy = _FaceProxy(face, kps_smooth, bbox_smooth)
         self._last_face = face_proxy
 
         # Tracker-i yenilə
-        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+        x1, y1, x2, y2 = [_to_int(v) for v in face.bbox]
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(frame.shape[1] - 1, x2), min(frame.shape[0] - 1, y2)
         if x2 > x1 and y2 > y1:
@@ -733,19 +816,22 @@ class VideoFaceSwapper:
         if not tracked_faces:
             return frame
 
-        # Swap
+        # Swap — enhancement yalnız üz crop-una tətbiq olunur (tam frame deyil)
         result = frame.copy()
         for tgt_face in tracked_faces:
             if _face_is_valid(tgt_face, frame.shape):
                 try:
                     result = _swap_single_face(
-                        result, tgt_face, source_face, self.crop_size
+                        result, tgt_face, source_face, self.crop_size,
+                        enhance=high_quality,
                     )
                 except Exception as e:
                     log.debug("_swap_single_face xətası: %s", e)
 
-        # DÜZƏLTMƏ 2: Mənbə şəkildəki eynyəyi videoya köçür
-        if (self._source_img is not None and
+        # Mənbə şəkildəki eynək/saçı videoya köçür (default söndürülüb — bax
+        # ENABLE_GLASSES_HAIR_TRANSFER). Kobud transfer titrəmə/qutu kənarı yaradır.
+        if (ENABLE_GLASSES_HAIR_TRANSFER and
+                self._source_img is not None and
                 self._source_face_obj is not None):
             src_glasses = _extract_glasses_region(
                 self._source_img, self._source_face_obj
@@ -757,9 +843,6 @@ class VideoFaceSwapper:
                             result, src_glasses, tgt_face, "glasses"
                         )
 
-        # DÜZƏLTMƏ 3: Mənbə şəkildəki saçı videoya köçür
-        if (self._source_img is not None and
-                self._source_face_obj is not None):
             src_hair = _extract_hair_region(
                 self._source_img, self._source_face_obj
             )
@@ -769,9 +852,6 @@ class VideoFaceSwapper:
                         result = _blend_region_onto_frame(
                             result, src_hair, tgt_face, "hair"
                         )
-
-        if high_quality:
-            result = enhance_face(result)
 
         return result
 

@@ -1,7 +1,15 @@
+# ── əsas ──
+insightface
+opencv-python
+numpy
+
+# ── enhancement modellər ──
 torch
 torchvision
 torchaudio
 facexlib
 gfpgan
 basicsr
-codeformer  # əgər pip-də varsa
+
+# ── video ──
+ffmpeg-python

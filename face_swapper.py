@@ -30,21 +30,6 @@ from insightface.app import FaceAnalysis
 
 log = logging.getLogger(__name__)
 
-# ─── GPU / CPU provider auto-select ──────────────────────────────────────────
-def _get_providers() -> list:
-    try:
-        import torch
-        if torch.cuda.is_available():
-            log.info("CUDA GPU: %s", torch.cuda.get_device_name(0))
-            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    except Exception:
-        pass
-    return ["CPUExecutionProvider"]
-
-_PROVIDERS = _get_providers()
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 # ──────────────────────── global singletons ────────────────────────
 _face_app  = None
 _swapper   = None
@@ -55,6 +40,12 @@ _lock = threading.Lock()
 
 MODEL_DIR = Path(__file__).parent / "models"
 MODEL_DIR.mkdir(exist_ok=True)
+
+# ──────────────────────── davranış flag-ləri ────────────────────────
+# Üz ölçüsü "scale fix": INSwapper onsuz da üzü hədəf başına uyğunlaşdırır.
+# Sonradan mənbə göz məsafəsinə görə crop-u scale etmək çənə/alın kənarında
+# ikiqat kontur (ghosting/seam) yaradır. Default söndürülüb; lazım olsa True et.
+ENABLE_FACE_SCALE_FIX = False
 
 # ──────────────────────── ArcFace 5-pt template (112×112) ────────────────────────
 # sol göz, sağ göz, burun, sol ağız kənarı, sağ ağız kənarı
@@ -85,10 +76,9 @@ def get_face_app() -> FaceAnalysis:
                 app = FaceAnalysis(
                     name="buffalo_l",
                     root=str(MODEL_DIR),
-                    providers=_PROVIDERS,
+                    providers=["CPUExecutionProvider"],
                 )
-                ctx = 0 if "CUDAExecutionProvider" in _PROVIDERS else -1
-                app.prepare(ctx_id=ctx, det_size=(640, 640))
+                app.prepare(ctx_id=0, det_size=(640, 640))
                 _face_app = app
     return _face_app
 
@@ -104,7 +94,7 @@ def get_swapper():
                         "inswapper_128.onnx tapılmadı! models/ qovluğuna yükləyin."
                     )
                 _swapper = insightface.model_zoo.get_model(
-                    path, providers=_PROVIDERS
+                    path, providers=["CPUExecutionProvider"]
                 )
     return _swapper
 
@@ -355,7 +345,7 @@ def _paste_back(swapped_crop: np.ndarray,
     # ── Üz ölçüsü düzəltməsi ──
     # Mənbənin göz məsafəsi / hedefin göz məsafəsi = scale factor
     # Bu scale-i aligned crop üzərindəki template məsafəsinə tətbiq edirik
-    if src_face is not None and tgt_face is not None:
+    if ENABLE_FACE_SCALE_FIX and src_face is not None and tgt_face is not None:
         scale_ratio = _compute_face_scale_ratio(src_face, tgt_face)
         # Yalnız 0.7–1.4 aralığında tətbiq et (ekstremal halları yox et)
         scale_ratio = float(np.clip(scale_ratio, 0.70, 1.40))
@@ -404,8 +394,18 @@ def _paste_back(swapped_crop: np.ndarray,
         except Exception as e:
             log.debug("Occlusion removal xətası: %s", e)
 
-    # Kənarları yumşat
-    mask_full = cv2.GaussianBlur(mask_full, (25, 25), 10)
+    # Kənarları yumşat — blur radiusunu üz ölçüsünə uyğunlaşdır
+    if tgt_face is not None:
+        try:
+            fw = float(tgt_face.bbox[2] - tgt_face.bbox[0])
+            k = int(np.clip(round(fw * 0.08), 7, 41))
+            if k % 2 == 0:
+                k += 1
+        except Exception:
+            k = 25
+    else:
+        k = 25
+    mask_full = cv2.GaussianBlur(mask_full, (k, k), 0)
     mask_f = mask_full.astype(np.float32) / 255.0
 
     result = (
@@ -532,9 +532,28 @@ def _bisenet_mask(aligned_img: np.ndarray, crop_size: int) -> Optional[np.ndarra
         with torch.no_grad():
             out = net(inp)[0]
         parsing = out.squeeze(0).argmax(0).numpy().astype(np.uint8)
-        # Üz bölgəsi sinifləri
-        face_classes = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17}
+        # Üz bölgəsi sinifləri — AĞIZ (11=diş,12=üst dodaq,13=alt dodaq) ÇIXARILIB.
+        #
+        # Səbəb: mənbə yalnız TƏK statik şəkildir. Hər frame-də ağız bölgəsi
+        # mənbənin sabit dodaqları ilə əvəzlənəndə, hədəfin əsl çeynəmə/yemək/
+        # danışıq hərəkəti itir — nəticə "donmuş ağız" effekti verir.
+        #
+        # Ağızı maskadan çıxarmaqla, o bölgə ORİJİNAL hədəf video pikselləri
+        # olaraq qalır → çeynəmə, yemək, dil hərəkəti təbii axır, yalnız üzün
+        # forması/gözlər/burun/yanaqlar dəyişdirilir.
+        face_classes = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 17}
+        mouth_classes = {11, 12, 13}
+
         mask = np.isin(parsing, list(face_classes)).astype(np.uint8) * 255
+        mouth_mask = np.isin(parsing, list(mouth_classes)).astype(np.uint8) * 255
+
+        # Ağız ətrafına yumşaq keçid payı qoy (kəskin kənar olmasın)
+        # Ağız bölgəsini bir az genişləndirib maskadan çıxarırıq —
+        # beləliklə dodaq kənarında da sürüşmə/qarışıq görünməz
+        if np.sum(mouth_mask) > 0:
+            k_mouth = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+            mouth_mask_expanded = cv2.dilate(mouth_mask, k_mouth, iterations=1)
+            mask = cv2.subtract(mask, mouth_mask_expanded)
         mask = cv2.resize(mask, (crop_size, crop_size),
                           interpolation=cv2.INTER_LINEAR)
 
@@ -548,12 +567,21 @@ def _bisenet_mask(aligned_img: np.ndarray, crop_size: int) -> Optional[np.ndarra
         return None
 
 
+# 106-nöqtə landmark-da ağız konturu indeksləri (insightface standardı)
+# Daxili ağız: 52-71 arası; xarici dodaq konturunu ehtiva edən aralıq 52-71
+_MOUTH_LM_RANGE = list(range(52, 72))
+
+
 def _landmark_mask(aligned_img_shape: tuple,
                    aligned_face,
                    crop_size: int) -> np.ndarray:
     """
     Fallback: 106-nöqtə landmark convex hull maskası.
     aligned_face — aligned crop üzərindəki üz.
+
+    Ağız bölgəsi (52-71) konturdan çıxarılır ki, hədəfin əsl ağız
+    hərəkəti (çeynəmə, yemək, danışıq) BiSeNet olmadığı halda da
+    görünsün — donmuş ağız effekti önlənir.
     """
     mask = np.zeros((crop_size, crop_size), dtype=np.uint8)
 
@@ -562,6 +590,18 @@ def _landmark_mask(aligned_img_shape: tuple,
         pts = np.clip(lm.astype(np.int32), 0, crop_size - 1)
         hull = cv2.convexHull(pts)
         cv2.fillConvexPoly(mask, hull, 255)
+
+        # Ağız bölgəsini maskadan çıxar
+        if len(lm) >= 72:
+            mouth_pts = np.clip(
+                lm[_MOUTH_LM_RANGE].astype(np.int32), 0, crop_size - 1
+            )
+            mouth_hull = cv2.convexHull(mouth_pts)
+            mouth_mask = np.zeros((crop_size, crop_size), dtype=np.uint8)
+            cv2.fillConvexPoly(mouth_mask, mouth_hull, 255)
+            k_m = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+            mouth_mask = cv2.dilate(mouth_mask, k_m, iterations=1)
+            mask = cv2.subtract(mask, mouth_mask)
     else:
         # bbox əsasında ellips
         try:
@@ -643,8 +683,24 @@ def _lab_color_match(src: np.ndarray,
 
 # ──────────────────────── enhancement ────────────────────────
 
-def enhance_face(img: np.ndarray) -> np.ndarray:
-    """CodeFormer → GFPGAN → yüngül sharpen sıra ilə."""
+def _unsharp_mask(img: np.ndarray,
+                  amount: float = 0.5,
+                  radius: float = 1.0) -> np.ndarray:
+    """
+    Düzgün unsharp mask: parlaqlığı dəyişmədən detalı qabardır.
+    (Köhnə filter2D kernel-i cəmi 1.0 deyildi → şəkli qaraldırdı; bu onu düzəldir.)
+    """
+    blur = cv2.GaussianBlur(img, (0, 0), radius)
+    return cv2.addWeighted(img, 1.0 + amount, blur, -amount, 0)
+
+
+def enhance_face(img: np.ndarray, only_center_face: bool = True) -> np.ndarray:
+    """
+    Swap olunmuş üz crop-unu yaxşılaşdır: CodeFormer → GFPGAN → yüngül unsharp.
+
+    Qeyd: bu funksiya artıq tam frame deyil, aligned üz crop-u üzərində işləməyə
+    yönəlib (CodeFormer/GFPGAN üz crop-unda daha yaxşı və daha sürətli nəticə verir).
+    """
     cf = get_codeformer()
     if cf is not None:
         try:
@@ -667,13 +723,10 @@ def enhance_face(img: np.ndarray) -> np.ndarray:
         try:
             _, _, enh = gf.enhance(img,
                                     has_aligned=False,
-                                    only_center_face=False,
+                                    only_center_face=only_center_face,
                                     paste_back=True)
             if enh is not None:
-                # Yüngül sharpen
-                k = np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]],
-                              dtype=np.float32) * 0.4
-                return cv2.filter2D(enh, -1, k)
+                return _unsharp_mask(enh, amount=0.5, radius=1.0)
         except Exception as e:
             log.debug("GFPGAN xətası: %s", e)
 
@@ -685,10 +738,14 @@ def enhance_face(img: np.ndarray) -> np.ndarray:
 def _swap_single_face(frame: np.ndarray,
                       tgt_face,
                       src_face,
-                      crop_size: int = 512) -> np.ndarray:
+                      crop_size: int = 512,
+                      enhance: bool = False) -> np.ndarray:
     """
     Bir hədəf üzü üçün tam pipeline:
-    align → detect-in-crop → swap → color-match → paste_back (scale + occlusion)
+    align → detect-in-crop → swap → color-match → (enhance) → paste_back (occlusion)
+
+    enhance=True olduqda CodeFormer/GFPGAN yalnız aligned üz crop-una tətbiq olunur
+    (tam frame-ə deyil) — daha keyfiyyətli, daha sürətli və fonu dəyişmir.
     """
     swapper = get_swapper()
 
@@ -730,7 +787,14 @@ def _swap_single_face(frame: np.ndarray,
     # ── 5. LAB color match (aligned space-də) ──
     swapped_colored = _lab_color_match(swapped_crop, aligned, mask)
 
-    # ── 6. Inverse warp + ölçü düzəltməsi + occlusion-aware blend ──
+    # ── 5b. Enhancement (yalnız üz crop-unda) ──
+    if enhance:
+        try:
+            swapped_colored = enhance_face(swapped_colored, only_center_face=True)
+        except Exception as e:
+            log.debug("crop enhance xətası: %s", e)
+
+    # ── 6. Inverse warp + occlusion-aware blend ──
     result = _paste_back(swapped_colored, frame, M, mask,
                          tgt_face=tgt_face, src_face=src_face)
     return result
@@ -757,10 +821,8 @@ def swap_frame(frame: np.ndarray,
 
     result = frame.copy()
     for tgt in target_faces:
-        result = _swap_single_face(result, tgt, source_face, crop_size)
-
-    if high_quality:
-        result = enhance_face(result)
+        result = _swap_single_face(result, tgt, source_face, crop_size,
+                                   enhance=high_quality)
 
     return result
 
@@ -788,7 +850,12 @@ def process_video(video_path: str,
                   source_image_path: str,
                   output_path: str,
                   all_faces: bool = False,
-                  progress_cb: Optional[Callable] = None) -> str:
+                  progress_cb: Optional[Callable] = None,
+                  high_quality: bool = True) -> str:
+    """
+    high_quality=True: hər frame-də swap olunmuş üz crop-u CodeFormer/GFPGAN ilə
+    yaxşılaşdırılır. CPU-da yavaş ola bilər — uzun videolarda False edin.
+    """
     if progress_cb:
         progress_cb(5, "Mənbə üzü analiz edilir...")
     source_face = extract_source_face(source_image_path)
@@ -815,7 +882,7 @@ def process_video(video_path: str,
             if not ret:
                 break
             processed = swap_frame(frame, source_face, all_faces,
-                                   high_quality=False)
+                                   high_quality=high_quality)
             writer.write(processed)
             idx += 1
             if progress_cb and idx % 4 == 0:
@@ -871,3 +938,4 @@ def get_model_info() -> dict:
         "model_dir": str(MODEL_DIR),
         "insightface_version": insightface.__version__,
     }
+
