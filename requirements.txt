@@ -1,15 +1,17 @@
 # ── əsas ──
+# numpy<2 vacibdir: insightface/basicsr numpy 2.x ilə çökür
+numpy<2
 insightface
-opencv-python
-numpy
+opencv-python-headless
+onnxruntime-gpu>=1.15.0
 
 # ── enhancement modellər ──
-torch
-torchvision
-torchaudio
-facexlib
-gfpgan
-basicsr
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
+basicsr==1.4.2
+facexlib==0.3.0
+gfpgan==1.3.8
 
 # ── video ──
 ffmpeg-python
