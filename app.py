@@ -1,218 +1,215 @@
-import os, uuid, json, time, threading, logging
+"""
+HuggingFace Spaces — FaceFusion 3.0+ Video Face Swap
+"""
+
+import os
+import sys
+import logging
+import shutil
 from pathlib import Path
-from flask import Flask, render_template, request, jsonify, send_from_directory, Response, stream_with_context
-from werkzeug.utils import secure_filename
 
-BASE_DIR = Path(__file__).parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-OUTPUT_DIR = BASE_DIR / "outputs"
-UPLOAD_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 log = logging.getLogger(__name__)
 
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 2048 * 1024 * 1024
+sys.path.insert(0, str(Path(__file__).parent))
+from facefusion_swapper_hf import (
+    process_video_facefusion,
+    process_image_facefusion,
+    get_model_info,
+)
 
-jobs = {}
-jobs_lock = threading.Lock()
+import gradio as gr
 
-ALLOWED_VIDEO = {"mp4", "avi", "mov", "mkv", "webm"}
-ALLOWED_IMAGE = {"jpg", "jpeg", "png", "bmp", "webp"}
+UPLOADS_DIR = Path("/tmp/facefusion_outputs")
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-
-def allowed_video(f):
-    return "." in f and f.rsplit(".", 1)[1].lower() in ALLOWED_VIDEO
-
-
-def allowed_image(f):
-    return "." in f and f.rsplit(".", 1)[1].lower() in ALLOWED_IMAGE
+_status = {"progress": 0, "message": "Ready"}
 
 
-@app.after_request
-def after_request(r):
-    r.headers["Access-Control-Allow-Origin"] = "*"
-    r.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
-    r.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    return r
+def _progress_cb(pct: int, msg: str):
+    _status["progress"] = pct
+    _status["message"] = msg
+    log.info("[%d%%] %s", pct, msg)
 
 
-@app.route("/")
-def index():
-    return render_template("index.html")
+def _find_output(expected_path: str, work_dir: Path) -> str:
+    """Find FaceFusion output file anywhere in work_dir."""
+    expected = Path(expected_path)
+
+    # Direct path
+    if expected.exists() and expected.stat().st_size > 1000:
+        return str(expected)
+
+    # Same directory
+    parent = expected.parent
+    candidates = [f for f in parent.glob("*.mp4") if f.stat().st_size > 1000]
+    if candidates:
+        return str(max(candidates, key=lambda p: p.stat().st_size))
+
+    # Recursive search in work_dir
+    all_mp4 = [f for f in work_dir.rglob("*.mp4") if f.stat().st_size > 1000]
+    if all_mp4:
+        return str(max(all_mp4, key=lambda p: p.stat().st_size))
+
+    raise FileNotFoundError(f"Output not found. Expected: {expected_path}")
 
 
-@app.route("/model-status")
-def model_status():
+def process_video_gradio(source_image, target_video, all_faces, high_quality,
+                         ref_dist, det_score, mask_blur, preset):
+    if not source_image or not target_video:
+        return None, "Error: Source image and target video required!"
+
+    _status["progress"] = 0
+
     try:
-        from face_swapper import get_model_info
-        return jsonify(get_model_info())
-    except Exception as e:
-        return jsonify({"swapper_exists": False, "error": str(e)})
+        sid = os.urandom(4).hex()
+        work_dir = UPLOADS_DIR / sid
+        work_dir.mkdir(parents=True, exist_ok=True)
 
+        src = work_dir / "source.jpg"
+        tgt = work_dir / "target.mp4"
+        out = work_dir / "output.mp4"
 
-@app.route("/swap", methods=["POST", "OPTIONS"])
-def swap():
-    if request.method == "OPTIONS":
-        return jsonify({}), 200
+        shutil.copy2(source_image, src)
+        shutil.copy2(target_video, tgt)
 
-    try:
-        mode = request.form.get("mode", "video")
+        log.info("Session: %s | Source: %s bytes | Target: %s bytes",
+                 sid, src.stat().st_size, tgt.stat().st_size)
 
-        if "source" not in request.files or "target" not in request.files:
-            return jsonify({"error": "source ve target lazimdir"}), 400
-
-        source_file = request.files["source"]
-        target_file = request.files["target"]
-        all_faces = request.form.get("all_faces", "false").lower() == "true"
-
-        # Fayl adı boşdursa xəta
-        if not source_file.filename:
-            return jsonify({"error": "Source fayl seçilməyib"}), 400
-        if not target_file.filename:
-            return jsonify({"error": "Target fayl seçilməyib"}), 400
-
-        if not allowed_image(source_file.filename):
-            return jsonify({"error": "Üz şəkli: jpg, png, webp olmalıdır"}), 400
-
-        if mode == "image":
-            if not allowed_image(target_file.filename):
-                return jsonify({"error": "Hədəf şəkil: jpg, png, webp olmalıdır"}), 400
-        else:
-            if not allowed_video(target_file.filename):
-                return jsonify({"error": "Video: mp4, avi, mov, mkv olmalıdır"}), 400
-
-        src_suffix = Path(secure_filename(source_file.filename)).suffix or ".jpg"
-        tgt_suffix = Path(secure_filename(target_file.filename)).suffix or ".mp4"
-
-        src_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{src_suffix}"
-        tgt_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{tgt_suffix}"
-        source_file.save(str(src_path))
-        target_file.save(str(tgt_path))
-
-        job_id = uuid.uuid4().hex
-        out_ext = ".jpg" if mode == "image" else ".mp4"
-        out_path = OUTPUT_DIR / f"{job_id}_swapped{out_ext}"
-
-        with jobs_lock:
-            jobs[job_id] = {
-                "status": "pending",
-                "progress": 0,
-                "message": "Gözlənilir...",
-                "output": None,
-                "error": None,
-                "mode": mode,
-            }
-
-        t = threading.Thread(
-            target=_run_job,
-            args=(job_id, str(src_path), str(tgt_path), str(out_path), all_faces, mode),
-            daemon=True,
+        result = process_video_facefusion(
+            source_image_path=str(src),
+            target_video_path=str(tgt),
+            output_path=str(out),
+            all_faces=all_faces,
+            high_quality=high_quality,
+            progress_cb=_progress_cb,
+            reference_face_distance=float(ref_dist),
+            face_detector_score=float(det_score),
+            face_mask_blur=float(mask_blur),
+            output_video_preset=preset,
+            execution_thread_count=8,
         )
-        t.start()
-        return jsonify({"job_id": job_id})
+
+        actual = _find_output(result, work_dir)
+        size_mb = Path(actual).stat().st_size / (1024 * 1024)
+
+        log.info("Result: %s (%.1f MB)", actual, size_mb)
+        return actual, f"Done! {size_mb:.1f} MB | Provider check logs"
 
     except Exception as e:
-        log.exception("swap error")
-        return jsonify({"error": str(e)}), 500
+        log.exception("Processing failed")
+        return None, f"Error: {str(e)}"
 
 
-def _run_job(job_id, src_path, tgt_path, out_path, all_faces, mode):
-    def progress(pct, msg):
-        with jobs_lock:
-            jobs[job_id].update({"progress": pct, "message": msg, "status": "running"})
+def process_image_gradio(source_image, target_image, all_faces, high_quality):
+    if not source_image or not target_image:
+        return None, "Error: Both images required!"
 
     try:
-        from face_swapper import process_video, process_image, check_model_available
+        sid = os.urandom(4).hex()
+        work_dir = UPLOADS_DIR / sid
+        work_dir.mkdir(parents=True, exist_ok=True)
 
-        if not check_model_available():
-            raise FileNotFoundError(
-                "inswapper_128.onnx modeli tapılmadı! models/ qovluğuna yükləyin."
-            )
+        src = work_dir / "source.jpg"
+        tgt = work_dir / "target.jpg"
+        out = work_dir / "output.jpg"
 
-        progress(1, "Başlanır...")
+        shutil.copy2(source_image, src)
+        shutil.copy2(target_image, tgt)
 
-        if mode == "image":
-            # FIX: source birinci, target ikinci — ardıcıllıq düzgündür
-            process_image(src_path, tgt_path, out_path, all_faces)
-            progress(100, "Tamamlandı!")
-        else:
-            # FIX: process_video(video_path, source_image_path, ...) — sıra düzgündür
-            process_video(tgt_path, src_path, out_path, all_faces, progress)
+        result = process_image_facefusion(
+            source_image_path=str(src),
+            target_image_path=str(tgt),
+            output_path=str(out),
+            all_faces=all_faces,
+            high_quality=high_quality,
+        )
 
-        # Output faylın yarandığını yoxla
-        if not Path(out_path).exists():
-            raise RuntimeError("Output fayl yaranmadı.")
-
-        with jobs_lock:
-            jobs[job_id].update({
-                "status": "done",
-                "progress": 100,
-                "output": Path(out_path).name,
-                "message": "Tamamlandı!",
-            })
+        actual = _find_output(result, work_dir)
+        return actual, "Done!"
 
     except Exception as e:
-        log.exception("job error")
-        with jobs_lock:
-            jobs[job_id].update({
-                "status": "error",
-                "error": str(e),
-                "message": f"Xəta: {e}",
-            })
-    finally:
-        for p in (src_path, tgt_path):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+        log.exception("Image processing failed")
+        return None, f"Error: {str(e)}"
 
 
-@app.route("/status/<job_id>")
-def status(job_id):
-    with jobs_lock:
-        job = jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "tapılmadı"}), 404
-    return jsonify(job)
+def get_system_info():
+    info = get_model_info()
+    return f"""GPU Available: {info.get('gpu_available', False)}
+GPU Count: {info.get('gpu_count', 0)}
+GPU Name: {info.get('gpu_name', 'N/A')}
+GPU Memory: {info.get('gpu_memory_gb', 0)} GB
+Provider: {info.get('execution_provider', 'N/A')}
+FaceFusion Ready: {info.get('facefusion_available', False)}""".strip()
 
 
-@app.route("/stream/<job_id>")
-def stream(job_id):
-    def generate():
-        while True:
-            with jobs_lock:
-                job = jobs.get(job_id)
-            if not job:
-                yield f"data: {json.dumps({'error': 'tapılmadı'})}\n\n"
-                break
-            yield f"data: {json.dumps(job)}\n\n"
-            if job["status"] in ("done", "error"):
-                break
-            time.sleep(0.8)
+with gr.Blocks(title="FaceFusion 3.0+ Video Face Swap", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("""
+    # 🎭 FaceFusion 3.0+ Temporal Consistency
+    **Professional video face swap — zero jitter & extreme pose support**
+    """)
 
-    return Response(
-        stream_with_context(generate()),
-        mimetype="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    with gr.Tab("🎬 Video Face Swap"):
+        with gr.Row():
+            with gr.Column(scale=1):
+                source_img = gr.Image(label="Source Face Image", type="filepath", image_mode="RGB")
+                target_vid = gr.Video(label="Target Video")
 
+            with gr.Column(scale=1):
+                with gr.Accordion("⚙️ Advanced Settings", open=False):
+                    all_faces_chk = gr.Checkbox(label="Swap all faces", value=False)
+                    hq_chk = gr.Checkbox(label="High quality (GFPGAN)", value=False)
+                    ref_dist = gr.Slider(label="Reference Face Distance (0.3=strict, 0.6=loose)",
+                                         minimum=0.2, maximum=0.8, step=0.05, value=0.6)
+                    det_score = gr.Slider(label="Face Detector Score (0.3=profile, 0.5=frontal)",
+                                          minimum=0.2, maximum=0.8, step=0.05, value=0.3)
+                    mask_blur = gr.Slider(label="Mask Blur (edge smoothness)",
+                                          minimum=0.0, maximum=1.0, step=0.05, value=0.5)
+                    preset = gr.Dropdown(label="Output Preset",
+                                         choices=["ultrafast", "superfast", "veryfast",
+                                                  "faster", "fast", "medium", "slow", "slower"],
+                                         value="fast")
 
-@app.route("/download/<filename>")
-def download(filename):
-    return send_from_directory(
-        str(OUTPUT_DIR), secure_filename(filename), as_attachment=True
-    )
+                process_btn = gr.Button("🚀 Process", variant="primary", size="lg")
+                output_vid = gr.Video(label="Result")
+                status_txt = gr.Textbox(label="Status", interactive=False)
 
+        process_btn.click(
+            fn=process_video_gradio,
+            inputs=[source_img, target_vid, all_faces_chk, hq_chk,
+                    ref_dist, det_score, mask_blur, preset],
+            outputs=[output_vid, status_txt],
+        )
 
-@app.route("/preview/<filename>")
-def preview(filename):
-    return send_from_directory(str(OUTPUT_DIR), secure_filename(filename))
+    with gr.Tab("🖼️ Image Face Swap"):
+        with gr.Row():
+            with gr.Column(scale=1):
+                src_img = gr.Image(label="Source Face", type="filepath")
+                tgt_img = gr.Image(label="Target Image", type="filepath")
+            with gr.Column(scale=1):
+                all_faces_img = gr.Checkbox(label="Swap all faces", value=False)
+                hq_img = gr.Checkbox(label="High quality", value=False)
+                process_img_btn = gr.Button("🚀 Process", variant="primary")
+                output_img = gr.Image(label="Result")
+                status_img = gr.Textbox(label="Status", interactive=False)
+
+        process_img_btn.click(
+            fn=process_image_gradio,
+            inputs=[src_img, tgt_img, all_faces_img, hq_img],
+            outputs=[output_img, status_img],
+        )
+
+    with gr.Tab("ℹ️ System Info"):
+        info_btn = gr.Button("Show System Info")
+        info_out = gr.Textbox(label="Info", lines=8, interactive=False)
+        info_btn.click(fn=get_system_info, outputs=info_out)
+        demo.load(fn=get_system_info, outputs=info_out)
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    print(f"Server: http://0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
-
+    demo.launch(server_name="0.0.0.0", server_port=port, share=False, show_error=True)

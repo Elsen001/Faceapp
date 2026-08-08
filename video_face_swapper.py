@@ -1,5 +1,16 @@
 """
-video_face_swapper.py  —  Professional video face swap pipeline (GPU UYĞUN)
+video_face_swapper.py  —  Professional video face swap pipeline
+Nim.video / Kling AI video pipeline-i ilə eyni arxitektura
+
+DÜZƏLİŞLƏR:
+  1. Cinsiyyət uyğunluğu — qadın şəkli yalnız qadına, kişi şəkli yalnız kişiyə
+  2. Ağız bölgəsində əşya tanıma — çəngəl, yemək, barmaq aşkarlanır
+  3. Əşya maskası — ağızdakı əşyalar orijinal qalır, başın içinə girmir
+  4. Temporal face tracking — KCF/CSRT tracker + frame-lər arası hamarlaşdırma
+  5. Parallel frame işləmə — CPU core-lardan istifadə
+  6. Scene-cut aşkarlaması — sahne keçidlərində tracker sıfırlanır
+  7. Üz kilidi — ilk üz yadda saxlanılır və başqa üzə keçmir
+  8. Cinsiyyət filtrasiyası təkmilləşdirilib — fallback mexanizmi əlavə olunub
 """
 
 import os
@@ -30,31 +41,29 @@ log = logging.getLogger(__name__)
 
 
 def _to_int(v) -> int:
+    """
+    NumPy massivini təhlükəsiz şəkildə Python int-ə çevirir.
+    """
     if isinstance(v, np.ndarray):
         v = v.reshape(-1)[0]
     return int(v)
 
 
-# ── GPU üçün worker sayı ──
-try:
-    import torch
-    if torch.cuda.is_available():
-        MAX_WORKERS = 2  # GPU üçün az worker (GPU bottleneck)
-    else:
-        MAX_WORKERS = 4
-except:
-    MAX_WORKERS = 4
-
 # ──────────────────────── sabitlər ────────────────────────
-DETECT_INTERVAL   = 3
-SCENE_CUT_THRESH  = 35.0
-EMA_ALPHA         = 0.45
-TRACKER_TYPE      = "CSRT"
+DETECT_INTERVAL   = 3    # hər neçə frame-də bir tam detect
+SCENE_CUT_THRESH  = 35.0 # sahne keçidi threshold-u
+EMA_ALPHA         = 0.45 # hamarlaşma faktoru
+MAX_WORKERS       = 4    # paralel swap thread sayı
+TRACKER_TYPE      = "CSRT"  # CSRT, KCF, MOSSE
 
 
 # ──────────────────────── Unified EMA Filter ────────────────────────
 
 class UnifiedEmaFilter:
+    """
+    Bbox və KPS-i EYNİ anda, EYNİ əmsalla hamarlaşdırır.
+    Bu, bbox ilə kps arasında faza fərqini aradan qaldırır.
+    """
     def __init__(self, alpha: float = EMA_ALPHA):
         self.alpha = alpha
         self._prev_bbox: Optional[np.ndarray] = None
@@ -81,6 +90,9 @@ class UnifiedEmaFilter:
 # ──────────────────────── Face Tracker ────────────────────────
 
 class FaceTracker:
+    """
+    Bir üz üçün temporal tracker.
+    """
     def __init__(self, face_id: int, tracker_type: str = TRACKER_TYPE):
         self.face_id     = face_id
         self.tracker_type = tracker_type
@@ -236,6 +248,9 @@ class FaceTracker:
 
 
 class _FaceProxy:
+    """
+    insightface face object-inin yüngül proxy-si.
+    """
     def __init__(self, original_face, kps: np.ndarray, bbox: np.ndarray):
         self._orig  = original_face
         self.kps    = kps
@@ -248,6 +263,9 @@ class _FaceProxy:
 # ──────────────────────── Scene Cut Detector ────────────────────────
 
 class SceneCutDetector:
+    """
+    Ardıcıl frame-lər arası fərqə görə sahne keçidini aşkarla.
+    """
     def __init__(self, threshold: float = SCENE_CUT_THRESH):
         self.threshold = threshold
         self._prev_lab: Optional[np.ndarray] = None
@@ -271,6 +289,9 @@ class SceneCutDetector:
 # ──────────────────────── Temporal Mask Blender ────────────────────────
 
 class TemporalMaskBlender:
+    """
+    Occlusion mask-larını frame-lər arası hamarlaşdır.
+    """
     def __init__(self, alpha: float = 0.4, history: int = 3):
         self.alpha   = alpha
         self._buffer: deque = deque(maxlen=history)
@@ -289,6 +310,9 @@ class TemporalMaskBlender:
 # ──────────────────────── VideoFaceSwapper ────────────────────────
 
 class VideoFaceSwapper:
+    """
+    Professional video face swap pipeline.
+    """
     def __init__(self,
                  detect_interval: int = DETECT_INTERVAL,
                  tracker_type:   str  = TRACKER_TYPE,
@@ -306,6 +330,10 @@ class VideoFaceSwapper:
         self._tmb       = TemporalMaskBlender()
         self._source_img: Optional[np.ndarray] = None
         self._source_face_obj = None
+        self._locked_face_id: Optional[int] = None  # kilit: ilk üzü saxla
+        self._locked_gender: Optional[int] = None   # kilit: cinsiyyət
+
+    # ── public API ──
 
     def process(self,
                 source_image: str,
@@ -314,7 +342,9 @@ class VideoFaceSwapper:
                 all_faces:    bool = False,
                 high_quality: bool = False,
                 progress_cb:  Optional[Callable] = None) -> str:
-        
+        """
+        Videonu işlə və output_video-ya yaz.
+        """
         self._progress(progress_cb, 2, "Mənbə üzü analiz edilir...")
         source_face = extract_source_face(source_image)
         self._source_img = cv2.imread(source_image)
@@ -341,6 +371,8 @@ class VideoFaceSwapper:
         self._trackers = []
         self._scene_cut.reset()
         self._tmb.reset()
+        self._locked_face_id = None  # Sıfırla
+        self._locked_gender = None   # Sıfırla
 
         try:
             self._process_loop(
@@ -366,6 +398,8 @@ class VideoFaceSwapper:
 
         self._progress(progress_cb, 100, "Tamamlandı!")
         return output_video
+
+    # ── daxili metodlar ──
 
     def _process_loop(self,
                       cap, writer,
@@ -486,6 +520,9 @@ class VideoFaceSwapper:
             for t in self._trackers:
                 t.reset()
             self._tmb.reset()
+            # Sahne keçidində kilidi sıfırla — yeni səhnədə yeni üz tap
+            self._locked_gender = None
+            self._locked_face_id = None  # Üz kilidini də sıfırla
 
         need_detect = (
             is_cut or
@@ -495,14 +532,54 @@ class VideoFaceSwapper:
 
         if need_detect:
             detected = _safe_detect(frame)
-            
+
+            # Cinsiyyətə görə filtr (daha etibarlı)
             if self.gender_match and detected:
                 detected = _match_gender(self._source_face_obj, detected)
-            
-            if not all_faces and detected:
-                detected = [max(detected,
-                               key=lambda f: (f.bbox[2] - f.bbox[0]) *
-                                             (f.bbox[3] - f.bbox[1]))]
+                
+                # Əgər cinsiyyət filtrindən sonra heç üz qalmayıbsa, hamısını götür
+                if not detected:
+                    detected = _safe_detect(frame)
+
+            if detected:
+                if not all_faces:
+                    # Ən böyük üzü seç
+                    detected = [max(detected,
+                                   key=lambda f: (f.bbox[2] - f.bbox[0]) *
+                                                 (f.bbox[3] - f.bbox[1]))]
+                
+                # Əgər kilitli üz varsa, onu saxlamağa çalış
+                if self._locked_face_id is not None:
+                    # Əvvəlki üzü track etməyə çalış
+                    old_face = None
+                    for tracker in self._trackers:
+                        if tracker.face_id == self._locked_face_id and tracker.is_active:
+                            old_face = tracker._last_face
+                            break
+                    
+                    if old_face is not None:
+                        # Köhnə üzə ən yaxın olanı seç
+                        best = None
+                        best_iou = 0.35
+                        for f in detected:
+                            iou = _bbox_iou(f.bbox, old_face.bbox)
+                            if iou > best_iou:
+                                best_iou = iou
+                                best = f
+                        if best is not None:
+                            detected = [best]
+                        else:
+                            # Köhnə üz yoxdursa, ən böyük üzü götür
+                            detected = [max(detected, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))]
+                
+                # Kilitli cinsiyyəti yenilə
+                if self._locked_gender is None and detected:
+                    first = detected[0]
+                    self._locked_gender = getattr(first, 'gender', None)
+                    if self._locked_gender is not None:
+                        log.debug("Üz kilitləndi: gender=%s, id=%s", 
+                                 self._locked_gender, self._locked_face_id)
+
             self._sync_trackers(frame, detected)
 
         tracked_faces = []
@@ -521,6 +598,7 @@ class VideoFaceSwapper:
         if not tracked_faces:
             return frame
 
+        # Cinsiyyətə görə filtr
         if self.gender_match:
             tracked_faces = _match_gender(source_face, tracked_faces)
         
@@ -549,31 +627,62 @@ class VideoFaceSwapper:
                 t = FaceTracker(i, self.tracker_type)
                 if t.init(frame, face):
                     self._trackers.append(t)
+                    # İlk üzü kilitlə
+                    if self._locked_face_id is None:
+                        self._locked_face_id = i
+                        log.debug("İlk üz kilitləndi: id=%d", i)
             return
 
         active = [(i, t) for i, t in enumerate(self._trackers) if t.is_active]
         matched_tracker_ids = set()
+        
+        # Əvvəlcə kilitli üzü tapmağa çalış
+        locked_tracker = None
+        if self._locked_face_id is not None:
+            for i, t in enumerate(self._trackers):
+                if i == self._locked_face_id and t.is_active:
+                    locked_tracker = (i, t)
+                    break
 
         for face in detected_faces:
-            best_iou  = 0.25
+            best_iou = 0.35  # İOU threshold-u artırıldı
             best_tidx = None
-            for tidx, t in active:
-                if tidx in matched_tracker_ids:
-                    continue
-                if t._last_face is None:
-                    continue
-                iou = _bbox_iou(face.bbox, t._last_face.bbox)
-                if iou > best_iou:
-                    best_iou  = iou
-                    best_tidx = tidx
+            
+            # Əvvəlcə kilitli trackeri yoxla
+            if locked_tracker is not None:
+                tidx, t = locked_tracker
+                if tidx not in matched_tracker_ids and t._last_face is not None:
+                    iou = _bbox_iou(face.bbox, t._last_face.bbox)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_tidx = tidx
+            
+            # Əgər kilitli tapılmadısa, digərlərini yoxla
+            if best_tidx is None:
+                for tidx, t in active:
+                    if tidx in matched_tracker_ids:
+                        continue
+                    if t._last_face is None:
+                        continue
+                    iou = _bbox_iou(face.bbox, t._last_face.bbox)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_tidx = tidx
 
             if best_tidx is not None:
                 self._trackers[best_tidx].reinit_with_face(frame, face)
                 matched_tracker_ids.add(best_tidx)
             else:
-                t = FaceTracker(len(self._trackers), self.tracker_type)
-                if t.init(frame, face):
-                    self._trackers.append(t)
+                # YENİ: Yalnız kilitli üz yoxdursa yeni tracker əlavə et
+                if self._locked_face_id is None:
+                    t = FaceTracker(len(self._trackers), self.tracker_type)
+                    if t.init(frame, face):
+                        self._trackers.append(t)
+                        self._locked_face_id = t.face_id
+                        log.debug("Yeni üz kilitləndi: id=%d", t.face_id)
+                else:
+                    log.debug("Yeni üz ignore edildi — kilitli üzə davam (id=%d)", 
+                             self._locked_face_id)
 
     @staticmethod
     def _progress(cb, pct: int, msg: str):
@@ -642,6 +751,22 @@ def process_video(source_image: str,
                   max_workers:     int = MAX_WORKERS,
                   crop_size:       int = 512,
                   gender_match:    bool = True) -> str:
+    """
+    Sadə bir funksiya ilə tam video face swap.
+
+    Args:
+        source_image:     Mənbə üz şəkli
+        input_video:      Giriş video faylı
+        output_video:     Çıxış video faylı
+        all_faces:        Bütün üzlər (False = ən böyük üz)
+        high_quality:     CodeFormer/GFPGAN enhancement (yavaş)
+        progress_cb:      callback(pct: int, msg: str)
+        detect_interval:  Hər neçə frame-də tam detect
+        tracker_type:     "CSRT" | "KCF" | "MOSSE"
+        max_workers:      Paralel swap thread sayı
+        crop_size:        Aligned crop ölçüsü
+        gender_match:     Eyni cinsiyyətə swap et (True = default)
+    """
     swapper = VideoFaceSwapper(
         detect_interval=detect_interval,
         tracker_type=tracker_type,
@@ -658,6 +783,8 @@ def process_video(source_image: str,
         progress_cb=progress_cb,
     )
 
+
+# ──────────────────────── CLI ────────────────────────
 
 if __name__ == "__main__":
     import argparse
@@ -689,6 +816,8 @@ if __name__ == "__main__":
                         help="Aligned crop ölçüsü (default: 512)")
     parser.add_argument("--no-gender-match", action="store_true",
                         help="Cinsiyyət uyğunluğunu söndür")
+    parser.add_argument("--no-audio", action="store_true",
+                        help="Audio birləşdirmə (yalnız video)")
     args = parser.parse_args()
 
     def progress(pct, msg):
